@@ -1,0 +1,112 @@
+# Conditional Brownian Bridge Diffusion Model (Pixel Space)
+# 任务: A(断裂车道线) -> B(完美车道线), 以 C(卫片) 为条件 (cross-attention 注入)
+# A/B 为同尺寸白底红线图, C 为同尺寸航拍切片; 三者同坐标系
+# 数据目录: dataset_path/{train,val,test}/{A,B,C}/同名.png
+runner: "BBDMRunner"
+training:
+  n_epochs: 300
+  n_steps: 400000
+  save_interval: 20
+  sample_interval: 10
+  validation_interval: 10
+  accumulate_grad_batches: 8   # 256² 像素空间 fp32 显存重, 小 batch + 累积
+
+testing:
+  clip_denoised: True
+  sample_num: 1
+  # guidance_scale: 1.5        # C 条件引导强度, >1 启用 CFG (需 cond_dropout>0 训练)
+
+data:
+  dataset_name: 'lane_lines'
+  dataset_type: 'custom_triple'
+  dataset_config:
+    dataset_path: 'dataset_path'   # 修改为实际路径
+    image_size: 256
+    channels: 3
+    to_normal: True
+    flip: True                     # A/B/C 共享翻转 (同 index 驱动)
+  train:
+    batch_size: 2                  # 24G 单卡起步值; 显存富余可加大
+    shuffle: True
+  val:
+    batch_size: 2
+    shuffle: True
+  test:
+    batch_size: 2
+    # shuffle: False
+
+model:
+  model_name: "CBBDM-pixel"   # part of result path
+  model_type: "BBDM"          # 像素空间模型
+  latent_before_quant_conv: False
+  normalize_latent: False
+  only_load_latent_mean_std: False
+  # model_load_path:      # model checkpoint path
+  # optim_sche_load_path: # optimizer scheduler checkpoint path
+
+  EMA:
+    use_ema: True
+    ema_decay: 0.995
+    update_ema_interval: 8    # step
+    start_ema_step: 20000
+
+  CondStageParams:            # ImageContextEncoder: 图C -> cross-attn tokens
+    in_channels: 3
+    width: 128
+    context_dim: 512
+    token_grid: 32            # 256/2³=32, 1024 tokens, 与 A/B 空间对齐
+    num_blocks: 3             # 3 个 stride-2 块: 256 -> 32
+
+  BB:
+    optimizer:
+      weight_decay: 0.000
+      optimizer: 'Adam'
+      lr: 1.e-4
+      beta1: 0.9
+
+    lr_scheduler:
+      factor: 0.5
+      patience: 3000
+      threshold: 0.0001
+      cooldown: 3000
+      min_lr: 5.e-7
+
+    params:
+      mt_type: 'linear'        # options {'linear', 'sin'}
+      objective: 'grad'        # options {'grad', 'noise', 'ysubx'}
+      loss_type: 'l1'          # options {'l1', 'l2'}
+
+      skip_sample: True
+      sample_type: 'linear'    # options {"linear", "sin"}
+      sample_step: 200
+
+      num_timesteps: 1000      # timesteps
+      eta: 1.0                 # DDIM reverse process eta
+      max_var: 1.0             # maximum variance
+      cond_dropout: 0.1        # 10% 样本丢弃 C: 训练 CFG + 防模型只依赖 A (A 是 C 的要素子集)
+
+      UNetParams:
+        image_size: 256        # 像素空间: 与数据分辨率一致
+        in_channels: 3
+        model_channels: 128
+        out_channels: 3
+        num_res_blocks: 2
+        attention_resolutions: !!python/tuple   # 32/16 特征层做注意力 (线连续性需要远端感受)
+          - 32
+          - 16
+        channel_mult: !!python/tuple            # 256->128->64->32->16
+          - 1
+          - 2
+          - 4
+          - 8
+          - 8
+        conv_resample: True
+        dims: 2
+        num_heads: 8
+        num_head_channels: 64
+        use_scale_shift_norm: True
+        resblock_updown: True
+        use_spatial_transformer: True   # C 走 cross-attention
+        context_dim: 512                # 与 CondStageParams.context_dim 一致
+        transformer_depth: 1
+        condition_key: "ImageContext"   # options {"ImageContext", "SpatialRescaler", "first_stage", "nocond"}

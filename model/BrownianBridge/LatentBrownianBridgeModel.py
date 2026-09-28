@@ -7,6 +7,7 @@ from tqdm.autonotebook import tqdm
 
 from model.BrownianBridge.BrownianBridgeModel import BrownianBridgeModel
 from model.BrownianBridge.base.modules.encoders.modules import SpatialRescaler
+from model.BrownianBridge.cond_encoder import ImageContextEncoder
 from model.VQGAN.vqgan import VQModel
 
 
@@ -33,6 +34,8 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
             self.cond_stage_model = self.vqgan
         elif self.condition_key == 'SpatialRescaler':
             self.cond_stage_model = SpatialRescaler(**vars(model_config.CondStageParams))
+        elif self.condition_key == 'ImageContext':
+            self.cond_stage_model = ImageContextEncoder(**vars(model_config.CondStageParams))
         else:
             raise NotImplementedError
 
@@ -40,8 +43,8 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
         return self
 
     def get_parameters(self):
-        if self.condition_key == 'SpatialRescaler':
-            print("get parameters to optimize: SpatialRescaler, UNet")
+        if self.condition_key in ('SpatialRescaler', 'ImageContext'):
+            print(f"get parameters to optimize: {self.condition_key}, UNet")
             params = itertools.chain(self.denoise_fn.parameters(), self.cond_stage_model.parameters())
         else:
             print("get parameters to optimize: UNet")
@@ -49,19 +52,22 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
         return params
 
     def apply(self, weights_init):
-        super().apply(weights_init)
-        if self.cond_stage_model is not None:
+        super().apply(weights_init)  # denoise_fn + ImageContextEncoder (含零初始化恢复)
+        if self.cond_stage_model is not None and not isinstance(self.cond_stage_model, ImageContextEncoder):
             self.cond_stage_model.apply(weights_init)
         return self
 
-    def forward(self, x, x_cond, context=None):
+    def forward(self, x, x_cond, c=None):
         with torch.no_grad():
             x_latent = self.encode(x, cond=False)
             x_cond_latent = self.encode(x_cond, cond=True)
-        context = self.get_cond_stage_context(x_cond)
-        return super().forward(x_latent.detach(), x_cond_latent.detach(), context)
+        context = self.get_cond_stage_context(x_cond, c)
+        return super().forward(x_latent.detach(), x_cond_latent.detach(), context=context)
 
-    def get_cond_stage_context(self, x_cond):
+    def get_cond_stage_context(self, x_cond, c=None):
+        if self.condition_key == 'ImageContext':
+            batch_size = c.shape[0] if c is not None else x_cond.shape[0]
+            return super().get_cond_stage_context(c, batch_size=batch_size)
         if self.cond_stage_model is not None:
             context = self.cond_stage_model(x_cond)
             if self.condition_key == 'first_stage':
@@ -100,13 +106,18 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
         return out
 
     @torch.no_grad()
-    def sample(self, x_cond, clip_denoised=False, sample_mid_step=False):
+    def sample(self, x_cond, c=None, clip_denoised=False, sample_mid_step=False, guidance_scale=1.0):
         x_cond_latent = self.encode(x_cond, cond=True)
+        context = self.get_cond_stage_context(x_cond, c)
+        context_null = self.get_null_context(x_cond.shape[0]) \
+            if (guidance_scale != 1.0 and context is not None) else None
         if sample_mid_step:
             temp, one_step_temp = self.p_sample_loop(y=x_cond_latent,
-                                                     context=self.get_cond_stage_context(x_cond),
+                                                     context=context,
                                                      clip_denoised=clip_denoised,
-                                                     sample_mid_step=sample_mid_step)
+                                                     sample_mid_step=sample_mid_step,
+                                                     context_null=context_null,
+                                                     guidance_scale=guidance_scale)
             out_samples = []
             for i in tqdm(range(len(temp)), initial=0, desc="save output sample mid steps", dynamic_ncols=True,
                           smoothing=0.01):
@@ -124,9 +135,11 @@ class LatentBrownianBridgeModel(BrownianBridgeModel):
             return out_samples, one_step_samples
         else:
             temp = self.p_sample_loop(y=x_cond_latent,
-                                      context=self.get_cond_stage_context(x_cond),
+                                      context=context,
                                       clip_denoised=clip_denoised,
-                                      sample_mid_step=sample_mid_step)
+                                      sample_mid_step=sample_mid_step,
+                                      context_null=context_null,
+                                      guidance_scale=guidance_scale)
             x_latent = temp
             out = self.decode(x_latent, cond=False)
             return out

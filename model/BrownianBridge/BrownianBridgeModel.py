@@ -6,10 +6,12 @@ import torch.nn.functional as F
 from functools import partial
 from tqdm.autonotebook import tqdm
 import numpy as np
+import itertools
 
 from model.utils import extract, default
 from model.BrownianBridge.base.modules.diffusionmodules.openaimodel import UNetModel
 from model.BrownianBridge.base.modules.encoders.modules import SpatialRescaler
+from model.BrownianBridge.cond_encoder import ImageContextEncoder
 
 
 class BrownianBridgeModel(nn.Module):
@@ -38,6 +40,16 @@ class BrownianBridgeModel(nn.Module):
         self.condition_key = model_params.UNetParams.condition_key
 
         self.denoise_fn = UNetModel(**vars(model_params.UNetParams))
+
+        # 图C 条件编码器: C 经 cross-attention 注入 UNet, 桥 A->B 的数学保持不变
+        self.cond_dropout = getattr(model_params, "cond_dropout", 0.0)
+        if self.condition_key == "ImageContext":
+            cond_params = getattr(model_config, "CondStageParams", None)
+            assert cond_params is not None, \
+                "condition_key=ImageContext 需要在 model.CondStageParams 配置 ImageContextEncoder 参数"
+            self.cond_stage_model = ImageContextEncoder(**vars(cond_params))
+        else:
+            self.cond_stage_model = None
 
     def register_schedule(self):
         T = self.num_timesteps
@@ -80,17 +92,40 @@ class BrownianBridgeModel(nn.Module):
 
     def apply(self, weight_init):
         self.denoise_fn.apply(weight_init)
+        cond_stage = getattr(self, "cond_stage_model", None)
+        if isinstance(cond_stage, ImageContextEncoder):
+            cond_stage.apply(weight_init)
+            cond_stage.reset_zero_init()
         return self
 
     def get_parameters(self):
+        if getattr(self, "cond_stage_model", None) is not None:
+            return itertools.chain(self.denoise_fn.parameters(), self.cond_stage_model.parameters())
         return self.denoise_fn.parameters()
 
-    def forward(self, x, y, context=None):
+    def get_cond_stage_context(self, c, batch_size=None):
+        """图C -> cross-attention token 序列; 训练期按 cond_dropout 整样本丢弃 (CFG)"""
+        if self.condition_key != "ImageContext" or self.cond_stage_model is None:
+            return None
+        if c is None:
+            return self.cond_stage_model.null_tokens(batch_size if batch_size is not None else 1)
+        drop_prob = self.cond_dropout if self.training else 0.0
+        return self.cond_stage_model(c, drop_prob=drop_prob)
+
+    def get_null_context(self, batch_size):
+        if self.condition_key != "ImageContext" or self.cond_stage_model is None:
+            return None
+        return self.cond_stage_model.null_tokens(batch_size)
+
+    def forward(self, x, y, c=None, context=None):
         if self.condition_key == "nocond":
             context = None
-        else:
-            context = y if context is None else context
-        b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
+        elif context is None:
+            if self.condition_key == "ImageContext":
+                context = self.get_cond_stage_context(c, batch_size=x.shape[0])
+            else:
+                context = y
+        b, c_ch, h, w, device, img_size, = *x.shape, x.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         return self.p_losses(x, y, context, t)
@@ -169,11 +204,21 @@ class BrownianBridgeModel(nn.Module):
         return imgs
 
     @torch.no_grad()
-    def p_sample(self, x_t, y, context, i, clip_denoised=False):
+    def p_sample(self, x_t, y, context, i, clip_denoised=False, context_null=None, guidance_scale=1.0):
         b, *_, device = *x_t.shape, x_t.device
+
+        def denoise(x_in, t):
+            # 去噪器输出; 若提供 null context 则做 classifier-free guidance:
+            # eps = (1+w) * eps(C) - w * eps(null)
+            out = self.denoise_fn(x_in, timesteps=t, context=context)
+            if context_null is not None:
+                out_null = self.denoise_fn(x_in, timesteps=t, context=context_null)
+                out = (1.0 + guidance_scale) * out - guidance_scale * out_null
+            return out
+
         if self.steps[i] == 0:
             t = torch.full((x_t.shape[0],), self.steps[i], device=x_t.device, dtype=torch.long)
-            objective_recon = self.denoise_fn(x_t, timesteps=t, context=context)
+            objective_recon = denoise(x_t, t)
             x0_recon = self.predict_x0_from_objective(x_t, y, t, objective_recon=objective_recon)
             if clip_denoised:
                 x0_recon.clamp_(-1., 1.)
@@ -182,7 +227,7 @@ class BrownianBridgeModel(nn.Module):
             t = torch.full((x_t.shape[0],), self.steps[i], device=x_t.device, dtype=torch.long)
             n_t = torch.full((x_t.shape[0],), self.steps[i+1], device=x_t.device, dtype=torch.long)
 
-            objective_recon = self.denoise_fn(x_t, timesteps=t, context=context)
+            objective_recon = denoise(x_t, t)
             x0_recon = self.predict_x0_from_objective(x_t, y, t, objective_recon=objective_recon)
             if clip_denoised:
                 x0_recon.clamp_(-1., 1.)
@@ -201,25 +246,34 @@ class BrownianBridgeModel(nn.Module):
             return x_tminus_mean + sigma_t * noise, x0_recon
 
     @torch.no_grad()
-    def p_sample_loop(self, y, context=None, clip_denoised=True, sample_mid_step=False):
+    def p_sample_loop(self, y, context=None, clip_denoised=True, sample_mid_step=False,
+                      context_null=None, guidance_scale=1.0):
         if self.condition_key == "nocond":
             context = None
-        else:
-            context = y if context is None else context
+        elif context is None and self.condition_key != "ImageContext":
+            context = y
 
         if sample_mid_step:
             imgs, one_step_imgs = [y], []
             for i in tqdm(range(len(self.steps)), desc=f'sampling loop time step', total=len(self.steps)):
-                img, x0_recon = self.p_sample(x_t=imgs[-1], y=y, context=context, i=i, clip_denoised=clip_denoised)
+                img, x0_recon = self.p_sample(x_t=imgs[-1], y=y, context=context, i=i,
+                                              clip_denoised=clip_denoised,
+                                              context_null=context_null, guidance_scale=guidance_scale)
                 imgs.append(img)
                 one_step_imgs.append(x0_recon)
             return imgs, one_step_imgs
         else:
             img = y
             for i in tqdm(range(len(self.steps)), desc=f'sampling loop time step', total=len(self.steps)):
-                img, _ = self.p_sample(x_t=img, y=y, context=context, i=i, clip_denoised=clip_denoised)
+                img, _ = self.p_sample(x_t=img, y=y, context=context, i=i,
+                                       clip_denoised=clip_denoised,
+                                       context_null=context_null, guidance_scale=guidance_scale)
             return img
 
     @torch.no_grad()
-    def sample(self, y, context=None, clip_denoised=True, sample_mid_step=False):
-        return self.p_sample_loop(y, context, clip_denoised, sample_mid_step)
+    def sample(self, y, c=None, clip_denoised=True, sample_mid_step=False, guidance_scale=1.0):
+        context = self.get_cond_stage_context(c, batch_size=y.shape[0])
+        context_null = self.get_null_context(y.shape[0]) \
+            if (guidance_scale != 1.0 and context is not None) else None
+        return self.p_sample_loop(y, context, clip_denoised, sample_mid_step,
+                                  context_null=context_null, guidance_scale=guidance_scale)

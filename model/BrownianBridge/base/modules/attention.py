@@ -172,7 +172,8 @@ class CrossAttention(nn.Module):
         h = self.heads
 
         q = self.to_q(x)
-        if context is not None:
+        if context is not None and context.ndim == 4:
+            # 图像形式条件 (b c h w) 转 token 序列; 已是 (b n d) 的 token 直接使用
             context = rearrange(context, 'b c h w -> b (h w) c')
         context = default(context, x)
         k = self.to_k(context)

@@ -60,7 +60,6 @@ class BBDMRunner(DiffusionBaseRunner):
         optimizer = get_optimizer(config.model.BB.optimizer, net.get_parameters())
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer,
                                                                mode='min',
-                                                               verbose=True,
                                                                threshold_mode='rel',
                                                                **vars(config.model.BB.lr_scheduler)
 )
@@ -97,7 +96,7 @@ class BBDMRunner(DiffusionBaseRunner):
         max_batch_num = 30000 // self.config.data.train.batch_size
 
         def calc_mean(batch, total_ori_mean=None, total_cond_mean=None):
-            (x, x_name), (x_cond, x_cond_name) = batch
+            (x, x_name), (x_cond, x_cond_name) = batch[0], batch[1]
             x = x.to(self.config.training.device[0])
             x_cond = x_cond.to(self.config.training.device[0])
 
@@ -111,7 +110,7 @@ class BBDMRunner(DiffusionBaseRunner):
             return total_ori_mean, total_cond_mean
 
         def calc_var(batch, ori_latent_mean=None, cond_latent_mean=None, total_ori_var=None, total_cond_var=None):
-            (x, x_name), (x_cond, x_cond_name) = batch
+            (x, x_name), (x_cond, x_cond_name) = batch[0], batch[1]
             x = x.to(self.config.training.device[0])
             x_cond = x_cond.to(self.config.training.device[0])
 
@@ -162,11 +161,14 @@ class BBDMRunner(DiffusionBaseRunner):
         self.logger(self.net.cond_latent_std)
 
     def loss_fn(self, net, batch, epoch, step, opt_idx=0, stage='train', write=True):
-        (x, x_name), (x_cond, x_cond_name) = batch
+        (x, x_name), (x_cond, x_cond_name) = batch[0], batch[1]
+        c = batch[2][0] if len(batch) > 2 else None
         x = x.to(self.config.training.device[0])
         x_cond = x_cond.to(self.config.training.device[0])
+        if c is not None:
+            c = c.to(self.config.training.device[0])
 
-        loss, additional_info = net(x, x_cond)
+        loss, additional_info = net(x, x_cond, c)
         if write and self.is_main_process:
             self.writer.add_scalar(f'loss/{stage}', loss, step)
             if additional_info.__contains__('recloss_noise'):
@@ -183,16 +185,19 @@ class BBDMRunner(DiffusionBaseRunner):
 
         print(sample_path)
 
-        (x, x_name), (x_cond, x_cond_name) = batch
+        (x, x_name), (x_cond, x_cond_name) = batch[0], batch[1]
+        c = batch[2][0] if len(batch) > 2 else None
 
         batch_size = x.shape[0] if x.shape[0] < 4 else 4
 
         x = x[0:batch_size].to(self.config.training.device[0])
         x_cond = x_cond[0:batch_size].to(self.config.training.device[0])
+        if c is not None:
+            c = c[0:batch_size].to(self.config.training.device[0])
 
         grid_size = 4
 
-        # samples, one_step_samples = net.sample(x_cond,
+        # samples, one_step_samples = net.sample(x_cond, c,
         #                                        clip_denoised=self.config.testing.clip_denoised,
         #                                        sample_mid_step=True)
         # self.save_images(samples, reverse_sample_path, grid_size, save_interval=200,
@@ -202,7 +207,7 @@ class BBDMRunner(DiffusionBaseRunner):
         #                  writer_tag=f'{stage}_one_step_sample' if stage != 'test' else None)
         #
         # sample = samples[-1]
-        sample = net.sample(x_cond, clip_denoised=self.config.testing.clip_denoised).to('cpu')
+        sample = net.sample(x_cond, c, clip_denoised=self.config.testing.clip_denoised).to('cpu')
         image_grid = get_image_grid(sample, grid_size, to_normal=self.config.data.dataset_config.to_normal)
         im = Image.fromarray(image_grid)
         im.save(os.path.join(sample_path, 'skip_sample.png'))
@@ -224,6 +229,7 @@ class BBDMRunner(DiffusionBaseRunner):
     @torch.no_grad()
     def sample_to_eval(self, net, test_loader, sample_path):
         condition_path = make_dir(os.path.join(sample_path, f'condition'))
+        context_path = make_dir(os.path.join(sample_path, 'context'))
         gt_path = make_dir(os.path.join(sample_path, 'ground_truth'))
         result_path = make_dir(os.path.join(sample_path, str(self.config.model.BB.params.sample_step)))
 
@@ -231,13 +237,17 @@ class BBDMRunner(DiffusionBaseRunner):
         batch_size = self.config.data.test.batch_size
         to_normal = self.config.data.dataset_config.to_normal
         sample_num = self.config.testing.sample_num
+        guidance_scale = getattr(self.config.testing, 'guidance_scale', 1.0)
         for test_batch in pbar:
-            (x, x_name), (x_cond, x_cond_name) = test_batch
+            (x, x_name), (x_cond, x_cond_name) = test_batch[0], test_batch[1]
+            c = test_batch[2][0] if len(test_batch) > 2 else None
             x = x.to(self.config.training.device[0])
             x_cond = x_cond.to(self.config.training.device[0])
+            if c is not None:
+                c = c.to(self.config.training.device[0])
 
             for j in range(sample_num):
-                sample = net.sample(x_cond, clip_denoised=False)
+                sample = net.sample(x_cond, c, clip_denoised=False, guidance_scale=guidance_scale)
                 # sample = net.sample_vqgan(x)
                 for i in range(batch_size):
                     condition = x_cond[i].detach().clone()
@@ -246,6 +256,9 @@ class BBDMRunner(DiffusionBaseRunner):
                     if j == 0:
                         save_single_image(condition, condition_path, f'{x_cond_name[i]}.png', to_normal=to_normal)
                         save_single_image(gt, gt_path, f'{x_name[i]}.png', to_normal=to_normal)
+                        if c is not None:
+                            save_single_image(c[i].detach().clone(), context_path,
+                                              f'{x_cond_name[i]}.png', to_normal=to_normal)
                     if sample_num > 1:
                         result_path_i = make_dir(os.path.join(result_path, x_name[i]))
                         save_single_image(result, result_path_i, f'output_{j}.png', to_normal=to_normal)

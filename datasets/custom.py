@@ -50,6 +50,47 @@ class CustomAlignedDataset(Dataset):
         return self.imgs_ori[i], self.imgs_cond[i]
 
 
+@Registers.datasets.register_with_name('custom_triple')
+class CustomTripleDataset(Dataset):
+    """A/B/C 三元组数据集 (CBBDM)
+
+    - B: ground truth (桥终点, 完美车道线)
+    - A: 源图 (桥起点, 断裂车道线)
+    - C: 条件图 (卫片, 编码为 cross-attention token, 不与 A 叠加)
+    目录: {dataset_path}/{stage}/{A,B,C}/同名文件
+    A/B/C 同坐标系, 翻转/resize 由相同 index 驱动, 保证几何同步。
+    """
+
+    def __init__(self, dataset_config, stage='train'):
+        super().__init__()
+        self.image_size = (dataset_config.image_size, dataset_config.image_size)
+        base = dataset_config.dataset_path
+        image_paths_ori = get_image_paths_from_dir(os.path.join(base, f'{stage}/B'))
+        image_paths_cond = get_image_paths_from_dir(os.path.join(base, f'{stage}/A'))
+        image_paths_ctx = get_image_paths_from_dir(os.path.join(base, f'{stage}/C'))
+        assert len(image_paths_ori) == len(image_paths_cond) == len(image_paths_ctx) > 0, \
+            f'{stage} 下 A/B/C 数量不一致或为空: ' \
+            f'A={len(image_paths_cond)} B={len(image_paths_ori)} C={len(image_paths_ctx)}'
+        stems_ori = [Path(p).stem for p in image_paths_ori]
+        stems_cond = [Path(p).stem for p in image_paths_cond]
+        stems_ctx = [Path(p).stem for p in image_paths_ctx]
+        assert stems_ori == stems_cond == stems_ctx, \
+            f'{stage} 下 A/B/C 文件名不一致, 无法按同名配对'
+        self.flip = dataset_config.flip if stage == 'train' else False
+        self.to_normal = dataset_config.to_normal
+
+        self.imgs_ori = ImagePathDataset(image_paths_ori, self.image_size, flip=self.flip, to_normal=self.to_normal)
+        self.imgs_cond = ImagePathDataset(image_paths_cond, self.image_size, flip=self.flip, to_normal=self.to_normal)
+        self.imgs_ctx = ImagePathDataset(image_paths_ctx, self.image_size, flip=self.flip, to_normal=self.to_normal)
+
+    def __len__(self):
+        return len(self.imgs_ori)
+
+    def __getitem__(self, i):
+        # 相同 index => 相同翻转决策, A/B/C 几何同步
+        return self.imgs_ori[i], self.imgs_cond[i], self.imgs_ctx[i]
+
+
 @Registers.datasets.register_with_name('custom_colorization_LAB')
 class CustomColorizationLABDataset(Dataset):
     def __init__(self, dataset_config, stage='train'):

@@ -738,7 +738,8 @@ class UNetModel(nn.Module):
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
-        if self.condition_key != 'nocond':
+        if self.condition_key not in ('nocond', 'ImageContext'):
+            # ImageContext: C 只经 cross-attention 注入, 不与 x 叠加
             x = th.cat([x, context], dim=1)
 
         h = x.type(self.dtype)
