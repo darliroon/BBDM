@@ -1,0 +1,114 @@
+# Paired Rectified Flow (像素空间)
+# 任务与 CBBDM 相同: A(断裂车道线) -> B(完美车道线), C(卫片) 为条件 (cross-attention 注入)
+# 内核差异 (相对 configs/Template-CBBDM.yaml):
+#   训练: 桥过程 -> 插值路径 x_t = (1-t)A + tB + γ·t(1-t)·z, 速度回归 (CFM 无偏目标)
+#   采样: 200 步随机祖先采样 -> N 步确定性 ODE (Euler/Heun)
+# UNet / CondStageParams / 数据管线与 CBBDM 完全一致 => 同条件对比
+runner: "BBDMRunner"
+training:
+  n_epochs: 300
+  n_steps: 400000
+  save_interval: 20
+  sample_interval: 10
+  validation_interval: 10
+  accumulate_grad_batches: 8   # 与 CBBDM 一致
+
+testing:
+  clip_denoised: True
+  sample_num: 1
+  # guidance_scale: 1.5        # C 条件引导强度, >1 启用 CFG (需 cond_dropout>0 训练)
+
+data:
+  dataset_name: 'lane_lines'
+  dataset_type: 'custom_triple'
+  dataset_config:
+    dataset_path: 'dataset_path'   # 修改为实际路径
+    image_size: 256
+    channels: 3
+    to_normal: True
+    flip: True                     # A/B/C 共享翻转 (同 index 驱动)
+  train:
+    batch_size: 2                  # 与 CBBDM 同值
+    shuffle: True
+  val:
+    batch_size: 2
+    shuffle: True
+  test:
+    batch_size: 2
+    # shuffle: False
+
+model:
+  model_name: "PRF-pixel"   # part of result path
+  model_type: "PRF"         # 像素空间 rectified flow 内核
+  latent_before_quant_conv: False
+  normalize_latent: False
+  only_load_latent_mean_std: False
+  # model_load_path:      # model checkpoint path
+  # optim_sche_load_path: # optimizer scheduler checkpoint path
+
+  EMA:
+    use_ema: True
+    ema_decay: 0.995
+    update_ema_interval: 8    # step
+    start_ema_step: 20000
+
+  CondStageParams:            # 与 CBBDM 完全一致: 图C -> cross-attn tokens
+    in_channels: 3
+    width: 128
+    context_dim: 512
+    token_grid: 32            # 256/2³=32, 1024 tokens
+    num_blocks: 3
+
+  BB:                         # 沿用 BB 配置段 (Runner 的 optimizer/调度器读取处)
+    optimizer:
+      weight_decay: 0.000
+      optimizer: 'Adam'
+      lr: 1.e-4
+      beta1: 0.9
+
+    lr_scheduler:
+      factor: 0.5
+      patience: 3000
+      threshold: 0.0001
+      cooldown: 3000
+      min_lr: 5.e-7
+
+    params:
+      # ---- PRF 内核参数 ----
+      loss_type: 'l1'          # 速度回归损失: 'l1' | 'l2'
+      gamma: 0.0               # γ: 插值噪声强度. 0=纯 rectified flow; >0 加噪声正则 (建议消融 0/0.05/0.1)
+      t_sampler: 'lognorm'     # 时间步分布: 'lognorm' (SD3 默认) | 'uniform'
+      lognorm_mean: 0.0        # logit-normal loc
+      lognorm_std: 1.0         # logit-normal scale
+      num_timesteps: 1000      # timestep 嵌入尺度 (t·1000), 与 CBBDM UNet 一致, 勿改
+      solver: 'heun'           # ODE 求解器: 'euler' (NFE=N) | 'heun' (NFE=2N, 2 阶)
+      sample_step: 25          # ODE 步数; heun 25 步 (50 NFE) ≈ CBBDM 200 步质量, 快 ~4x
+
+      cond_dropout: 0.1        # 与 CBBDM 一致: 10% 丢 C 训练 CFG
+      # mt_type / objective / eta / max_var / skip_sample / sample_type 为 CBBDM 专属, PRF 忽略
+
+      UNetParams:              # 与 CBBDM 完全一致
+        image_size: 256
+        in_channels: 3
+        model_channels: 128
+        out_channels: 3
+        num_res_blocks: 2
+        attention_resolutions: !!python/tuple
+          - 32
+          - 16
+        channel_mult: !!python/tuple
+          - 1
+          - 2
+          - 4
+          - 8
+          - 8
+        conv_resample: True
+        dims: 2
+        num_heads: 8
+        num_head_channels: 64
+        use_scale_shift_norm: True
+        resblock_updown: True
+        use_spatial_transformer: True   # C 走 cross-attention
+        context_dim: 512                # 与 CondStageParams.context_dim 一致
+        transformer_depth: 1
+        condition_key: "ImageContext"   # options {"ImageContext", "SpatialRescaler", "first_stage", "nocond"}

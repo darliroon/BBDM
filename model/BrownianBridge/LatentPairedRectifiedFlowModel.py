@@ -1,0 +1,152 @@
+import itertools
+
+import torch
+import torch.nn as nn
+from tqdm.autonotebook import tqdm
+
+from model.BrownianBridge.PairedRectifiedFlowModel import PairedRectifiedFlowModel
+from model.BrownianBridge.base.modules.encoders.modules import SpatialRescaler
+from model.BrownianBridge.cond_encoder import ImageContextEncoder
+from model.VQGAN.vqgan import VQModel
+
+
+def disabled_train(self, mode=True):
+    """Overwrite model.train with this function to make sure train/eval mode
+    does not change anymore."""
+    return self
+
+
+class LatentPairedRectifiedFlowModel(PairedRectifiedFlowModel):
+    """PRF 潜空间版: A/B 在 VQGAN 潜空间内做 rectified flow, C 仍走像素域 ImageContextEncoder。
+
+    与 LatentBrownianBridgeModel 同构: 编解码、latent mean/std、条件注入策略完全一致,
+    仅将桥内核替换为 PRF (插值路径 + 速度回归 + ODE 采样)。
+    """
+
+    def __init__(self, model_config):
+        super().__init__(model_config)
+
+        self.vqgan = VQModel(**vars(model_config.VQGAN.params)).eval()
+        self.vqgan.train = disabled_train
+        for param in self.vqgan.parameters():
+            param.requires_grad = False
+        print(f"load vqgan from {model_config.VQGAN.params.ckpt_path}")
+
+        # Condition Stage Model (与 LatentBrownianBridgeModel 一致:
+        # ImageContext 时 C 不经 VQGAN, 走像素域 ImageContextEncoder)
+        if self.condition_key == 'nocond':
+            self.cond_stage_model = None
+        elif self.condition_key == 'first_stage':
+            self.cond_stage_model = self.vqgan
+        elif self.condition_key == 'SpatialRescaler':
+            self.cond_stage_model = SpatialRescaler(**vars(model_config.CondStageParams))
+        elif self.condition_key == 'ImageContext':
+            self.cond_stage_model = ImageContextEncoder(**vars(model_config.CondStageParams))
+        else:
+            raise NotImplementedError
+
+    def get_parameters(self):
+        if self.condition_key in ('SpatialRescaler', 'ImageContext'):
+            print(f"get parameters to optimize: {self.condition_key}, UNet")
+            params = itertools.chain(self.denoise_fn.parameters(), self.cond_stage_model.parameters())
+        else:
+            print("get parameters to optimize: UNet")
+            params = self.denoise_fn.parameters()
+        return params
+
+    def apply(self, weights_init):
+        super().apply(weights_init)  # denoise_fn + ImageContextEncoder (含零初始化恢复)
+        if self.cond_stage_model is not None and not isinstance(self.cond_stage_model, ImageContextEncoder):
+            self.cond_stage_model.apply(weights_init)
+        return self
+
+    def forward(self, x, x_cond, c=None):
+        with torch.no_grad():
+            x_latent = self.encode(x, cond=False)
+            x_cond_latent = self.encode(x_cond, cond=True)
+        context = self.get_cond_stage_context(x_cond, c)
+        return super().forward(x_latent.detach(), x_cond_latent.detach(), context=context)
+
+    def get_cond_stage_context(self, x_cond, c=None):
+        if self.condition_key == 'ImageContext':
+            batch_size = c.shape[0] if c is not None else x_cond.shape[0]
+            return super().get_cond_stage_context(c, batch_size=batch_size)
+        if self.cond_stage_model is not None:
+            context = self.cond_stage_model(x_cond)
+            if self.condition_key == 'first_stage':
+                context = context.detach()
+        else:
+            context = None
+        return context
+
+    @torch.no_grad()
+    def encode(self, x, cond=True, normalize=None):
+        normalize = self.model_config.normalize_latent if normalize is None else normalize
+        model = self.vqgan
+        x_latent = model.encoder(x)
+        if not self.model_config.latent_before_quant_conv:
+            x_latent = model.quant_conv(x_latent)
+        if normalize:
+            if cond:
+                x_latent = (x_latent - self.cond_latent_mean) / self.cond_latent_std
+            else:
+                x_latent = (x_latent - self.ori_latent_mean) / self.ori_latent_std
+        return x_latent
+
+    @torch.no_grad()
+    def decode(self, x_latent, cond=True, normalize=None):
+        normalize = self.model_config.normalize_latent if normalize is None else normalize
+        if normalize:
+            if cond:
+                x_latent = x_latent * self.cond_latent_std + self.cond_latent_mean
+            else:
+                x_latent = x_latent * self.ori_latent_std + self.ori_latent_mean
+        model = self.vqgan
+        if self.model_config.latent_before_quant_conv:
+            x_latent = model.quant_conv(x_latent)
+        x_latent_quant, loss, _ = model.quantize(x_latent)
+        out = model.decode(x_latent_quant)
+        return out
+
+    @torch.no_grad()
+    def sample(self, x_cond, c=None, clip_denoised=False, sample_mid_step=False, guidance_scale=1.0):
+        x_cond_latent = self.encode(x_cond, cond=True)
+        context = self.get_cond_stage_context(x_cond, c)
+        context_null = self.get_null_context(x_cond.shape[0]) \
+            if (guidance_scale != 1.0 and context is not None) else None
+        if sample_mid_step:
+            temp, one_step_temp = self.p_sample_loop(y=x_cond_latent,
+                                                     context=context,
+                                                     clip_denoised=clip_denoised,
+                                                     sample_mid_step=sample_mid_step,
+                                                     context_null=context_null,
+                                                     guidance_scale=guidance_scale)
+            out_samples = []
+            for i in tqdm(range(len(temp)), initial=0, desc="save output sample mid steps", dynamic_ncols=True,
+                          smoothing=0.01):
+                with torch.no_grad():
+                    out = self.decode(temp[i].detach(), cond=False)
+                out_samples.append(out.to('cpu'))
+
+            one_step_samples = []
+            for i in tqdm(range(len(one_step_temp)), initial=0, desc="save one step sample mid steps",
+                          dynamic_ncols=True,
+                          smoothing=0.01):
+                with torch.no_grad():
+                    out = self.decode(one_step_temp[i].detach(), cond=False)
+                one_step_samples.append(out.to('cpu'))
+            return out_samples, one_step_samples
+        else:
+            temp = self.p_sample_loop(y=x_cond_latent,
+                                      context=context,
+                                      clip_denoised=clip_denoised,
+                                      sample_mid_step=sample_mid_step,
+                                      context_null=context_null,
+                                      guidance_scale=guidance_scale)
+            out = self.decode(temp, cond=False)
+            return out
+
+    @torch.no_grad()
+    def sample_vqgan(self, x):
+        x_rec, _ = self.vqgan(x)
+        return x_rec

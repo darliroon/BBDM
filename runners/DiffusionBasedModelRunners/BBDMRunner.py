@@ -7,6 +7,8 @@ from PIL import Image
 from Register import Registers
 from model.BrownianBridge.BrownianBridgeModel import BrownianBridgeModel
 from model.BrownianBridge.LatentBrownianBridgeModel import LatentBrownianBridgeModel
+from model.BrownianBridge.PairedRectifiedFlowModel import PairedRectifiedFlowModel
+from model.BrownianBridge.LatentPairedRectifiedFlowModel import LatentPairedRectifiedFlowModel
 from runners.DiffusionBasedModelRunners.DiffusionBaseRunner import DiffusionBaseRunner
 from runners.utils import weights_init, get_optimizer, get_dataset, make_dir, get_image_grid, save_single_image
 from tqdm.autonotebook import tqdm
@@ -23,6 +25,10 @@ class BBDMRunner(DiffusionBaseRunner):
             bbdmnet = BrownianBridgeModel(config.model).to(config.training.device[0])
         elif config.model.model_type == "LBBDM":
             bbdmnet = LatentBrownianBridgeModel(config.model).to(config.training.device[0])
+        elif config.model.model_type == "PRF":
+            bbdmnet = PairedRectifiedFlowModel(config.model).to(config.training.device[0])
+        elif config.model.model_type == "LPRF":
+            bbdmnet = LatentPairedRectifiedFlowModel(config.model).to(config.training.device[0])
         else:
             raise NotImplementedError
         bbdmnet.apply(weights_init)
